@@ -1,202 +1,136 @@
 import pandas as pd
-import os
+from fuzzywuzzy import fuzz
 from collections import defaultdict
-import numpy as np
-from typing import Dict, List, Tuple
-import hashlib
+import os
+import itertools
 
-class CSVSchemaAnalyzer:
-    def __init__(self, directory_path: str):
+class ColumnRelationshipFinder:
+    def __init__(self, directory_path):
         self.directory = directory_path
-        self.file_metadata = {}
-        self.column_stats = defaultdict(dict)
+        self.column_profiles = defaultdict(dict)
         self.relationships = []
-        self.suggested_primary_keys = {}
-        self.suggested_foreign_keys = []
     
     def analyze_all_files(self):
-        """Process all CSV files in the directory"""
-        for filename in os.listdir(self.directory):
-            if filename.endswith('.csv'):
-                filepath = os.path.join(self.directory, filename)
-                self.analyze_file(filepath)
-        
-        self.find_relationships()
-        self.suggest_keys()
+        """Process all CSV files in directory"""
+        csv_files = [f for f in os.listdir(self.directory) if f.endswith('.csv')]
+        for file in csv_files:
+            self.analyze_file(os.path.join(self.directory, file))
+        self.find_all_relationships()
     
-    def analyze_file(self, filepath: str):
+    def analyze_file(self, filepath):
         """Analyze a single CSV file"""
         try:
-            # Read first 1000 rows for analysis (adjust as needed)
-            df = pd.read_csv(filepath, nrows=1000)
+            df = pd.read_csv(filepath, nrows=1000)  # Sample data
+            filename = os.path.basename(filepath)
             
-            # Generate file metadata
-            file_hash = self._file_hash(filepath)
-            self.file_metadata[filepath] = {
-                'filename': os.path.basename(filepath),
-                'columns': list(df.columns),
-                'row_count': len(df),
-                'sample_data': df.head(1).to_dict(orient='records')[0],
-                'file_hash': file_hash
-            }
-            
-            # Analyze each column
-            for column in df.columns:
-                self.analyze_column(filepath, column, df[column])
-                
+            for col in df.columns:
+                self.column_profiles[filename][col] = {
+                    'dtype': str(df[col].dtype),
+                    'sample_values': list(df[col].dropna().unique()[:20]),
+                    'uniqueness': df[col].nunique() / len(df[col])
+                }
         except Exception as e:
-            print(f"Error processing {filepath}: {str(e)}")
-    
-    def analyze_column(self, filepath: str, column: str, series: pd.Series):
-        """Perform column-level analysis"""
-        # Basic stats
-        unique_count = series.nunique()
-        null_count = series.isnull().sum()
-        dtype = str(series.dtype)
+            print(f"Error processing {filepath}: {e}")
+
+    def find_all_relationships(self, min_name_similarity=60, min_value_overlap=0.1):
+        """
+        Compare every column with every other column across all tables
+        """
+        # Get all (filename, column_name) pairs
+        all_columns = []
+        for file, cols in self.column_profiles.items():
+            for col in cols:
+                all_columns.append((file, col))
         
-        # Value length analysis (for string columns)
-        if dtype == 'object':
-            lengths = series.dropna().astype(str).apply(len)
-            len_stats = {
-                'min_len': int(lengths.min()),
-                'max_len': int(lengths.max()),
-                'avg_len': float(lengths.mean())
-            }
-        else:
-            len_stats = {}
-        
-        # Store column statistics
-        self.column_stats[filepath][column] = {
-            'dtype': dtype,
-            'unique_count': int(unique_count),
-            'null_count': int(null_count),
-            'unique_ratio': float(unique_count / len(series)),
-            'sample_values': list(series.dropna().unique()[:5]),
-            **len_stats
-        }
-    
-    def find_relationships(self):
-        """Find potential relationships between tables"""
-        # Group columns by their characteristics
-        column_groups = defaultdict(list)
-        
-        for filepath, columns in self.column_stats.items():
-            for col_name, stats in columns.items():
-                key = (stats['dtype'], stats['unique_ratio'])
-                column_groups[key].append((filepath, col_name))
-        
-        # Look for potential foreign key relationships
-        for group, columns in column_groups.items():
-            if len(columns) > 1 and group[0] != 'object':  # Skip high-cardinality text fields
-                # Sort by uniqueness (more unique = more likely to be PK)
-                sorted_cols = sorted(columns, 
-                                  key=lambda x: self.column_stats[x[0]][x[1]]['unique_ratio'], 
-                                  reverse=True)
-                
-                # The most unique column is likely the PK
-                pk_candidate = sorted_cols[0]
-                
-                # Others may be FKs referencing it
-                for other in sorted_cols[1:]:
-                    if self._values_compatible(pk_candidate, other):
-                        self.relationships.append({
-                            'pk_file': pk_candidate[0],
-                            'pk_column': pk_candidate[1],
-                            'fk_file': other[0],
-                            'fk_column': other[1],
-                            'confidence': self._calculate_confidence(pk_candidate, other)
-                        })
-    
-    def suggest_keys(self):
-        """Suggest primary and foreign keys based on analysis"""
-        # Suggest primary keys (columns with high uniqueness)
-        for filepath, columns in self.column_stats.items():
-            best_pk = None
-            best_score = 0
+        # Compare all unique pairs
+        for (file1, col1), (file2, col2) in itertools.combinations(all_columns, 2):
+            if file1 == file2:  # Skip same table comparisons
+                continue
             
-            for col_name, stats in columns.items():
-                # Score based on uniqueness and null count
-                score = stats['unique_ratio'] * (1 - (stats['null_count'] / self.file_metadata[filepath]['row_count']))
-                
-                # Penalize string columns unless they look like IDs
-                if stats['dtype'] == 'object':
-                    if not (stats['min_len'] == stats['max_len'] and stats['avg_len'] < 20):
-                        score *= 0.5
-                
-                if score > best_score:
-                    best_score = score
-                    best_pk = col_name
+            profile1 = self.column_profiles[file1][col1]
+            profile2 = self.column_profiles[file2][col2]
             
-            if best_pk and best_score > 0.8:  # Threshold for PK confidence
-                self.suggested_primary_keys[filepath] = best_pk
+            # Check basic compatibility
+            if profile1['dtype'] != profile2['dtype']:
+                continue
+            
+            # Calculate name similarity
+            name_sim = fuzz.token_sort_ratio(col1.lower(), col2.lower())
+            
+            # Calculate value overlap
+            set1 = set(str(x) for x in profile1['sample_values'])
+            set2 = set(str(x) for x in profile2['sample_values'])
+            overlap = len(set1 & set2)
+            overlap_ratio = overlap / min(len(set1), len(set2)) if min(len(set1), len(set2)) > 0 else 0
+            
+            # Check if meets thresholds
+            if name_sim >= min_name_similarity or overlap_ratio >= min_value_overlap:
+                confidence = self.calculate_confidence(name_sim, overlap_ratio)
+                
+                self.relationships.append({
+                    'table1': file1,
+                    'column1': col1,
+                    'table2': file2,
+                    'column2': col2,
+                    'confidence': confidence,
+                    'name_similarity': name_sim,
+                    'value_overlap': overlap_ratio,
+                    'dtype': profile1['dtype']
+                })
         
-        # Suggest foreign keys from relationships
+        # Sort by confidence
+        self.relationships.sort(key=lambda x: x['confidence'], reverse=True)
+    
+    def calculate_confidence(self, name_sim, value_overlap):
+        """Simple confidence calculation"""
+        return (name_sim * 0.4 + value_overlap * 100 * 0.6) / 100
+    
+    def get_relationships_for_column(self, table, column):
+        """Get all relationships for a specific column"""
+        return [r for r in self.relationships 
+                if (r['table1'] == table and r['column1'] == column) or
+                (r['table2'] == table and r['column2'] == column)]
+    
+    def visualize_relationships(self, min_confidence=0.5):
+        """Generate a network visualization"""
+        import networkx as nx
+        import matplotlib.pyplot as plt
+        
+        G = nx.Graph()
+        
+        # Add nodes (columns with table info)
+        added_nodes = set()
         for rel in self.relationships:
-            if rel['pk_file'] in self.suggested_primary_keys:
-                if rel['pk_column'] == self.suggested_primary_keys[rel['pk_file']]:
-                    self.suggested_foreign_keys.append({
-                        'source_file': rel['fk_file'],
-                        'source_column': rel['fk_column'],
-                        'target_file': rel['pk_file'],
-                        'target_column': rel['pk_column'],
-                        'confidence': rel['confidence']
-                    })
-    
-    def _values_compatible(self, pk_candidate: Tuple[str, str], fk_candidate: Tuple[str, str]) -> bool:
-        """Check if values in two columns are compatible"""
-        pk_file, pk_col = pk_candidate
-        fk_file, fk_col = fk_candidate
+            if rel['confidence'] >= min_confidence:
+                node1 = f"{rel['table1']}.{rel['column1']}"
+                node2 = f"{rel['table2']}.{rel['column2']}"
+                if node1 not in added_nodes:
+                    G.add_node(node1)
+                    added_nodes.add(node1)
+                if node2 not in added_nodes:
+                    G.add_node(node2)
+                    added_nodes.add(node2)
+                G.add_edge(node1, node2, weight=rel['confidence'])
         
-        pk_stats = self.column_stats[pk_file][pk_col]
-        fk_stats = self.column_stats[fk_file][fk_col]
+        # Draw the graph
+        plt.figure(figsize=(15, 15))
+        pos = nx.spring_layout(G, k=0.5, iterations=50)
         
-        # Basic type check
-        if pk_stats['dtype'] != fk_stats['dtype']:
-            return False
+        # Draw nodes
+        nx.draw_networkx_nodes(G, pos, node_size=1000, node_color='lightblue')
         
-        # If PK has more unique values than FK, it's a possible relationship
-        if pk_stats['unique_ratio'] < fk_stats['unique_ratio']:
-            return False
+        # Draw edges with weights
+        edges = G.edges(data=True)
+        nx.draw_networkx_edges(
+            G, pos, 
+            edgelist=[(u, v) for u, v, d in edges],
+            width=[d['weight']*3 for u, v, d in edges],
+            alpha=0.5
+        )
         
-        # Sample values check (at least some overlap)
-        pk_samples = set(str(x) for x in pk_stats['sample_values'])
-        fk_samples = set(str(x) for x in fk_stats['sample_values'])
+        # Draw labels
+        nx.draw_networkx_labels(G, pos, font_size=8)
         
-        return len(pk_samples & fk_samples) > 0
-    
-    def _calculate_confidence(self, pk_candidate: Tuple[str, str], fk_candidate: Tuple[str, str]) -> float:
-        """Calculate confidence score for a relationship"""
-        pk_file, pk_col = pk_candidate
-        fk_file, fk_col = fk_candidate
-        
-        pk_stats = self.column_stats[pk_file][pk_col]
-        fk_stats = self.column_stats[fk_file][fk_col]
-        
-        # Base confidence on uniqueness ratios
-        base_score = min(pk_stats['unique_ratio'], 1 - fk_stats['unique_ratio'])
-        
-        # Boost if sample values match exactly
-        pk_samples = set(str(x) for x in pk_stats['sample_values'])
-        fk_samples = set(str(x) for x in fk_stats['sample_values'])
-        overlap = len(pk_samples & fk_samples)
-        sample_boost = overlap / len(pk_samples) if len(pk_samples) > 0 else 0
-        
-        return min(1.0, base_score + (sample_boost * 0.3))
-    
-    def _file_hash(self, filepath: str) -> str:
-        """Calculate file hash to identify duplicate files"""
-        hasher = hashlib.md5()
-        with open(filepath, 'rb') as f:
-            buf = f.read()
-            hasher.update(buf)
-        return hasher.hexdigest()
-    
-    def generate_report(self) -> Dict:
-        """Generate a comprehensive report of findings"""
-        return {
-            'file_metadata': self.file_metadata,
-            'column_statistics': self.column_stats,
-            'suggested_primary_keys': self.suggested_primary_keys,
-            'suggested_foreign_keys': self.suggested_foreign_keys,
-            'all_relationships': self.relationships
-        }
+        plt.title(f"Column Relationships (confidence ≥ {min_confidence})")
+        plt.axis('off')
+        plt.show()
